@@ -117,6 +117,13 @@ pub struct IndexingSettings {
     pub merge_policy: MergePolicyConfig,
     #[serde(default)]
     pub resources: IndexingResources,
+    /// Maximum time range in seconds that a split should span.
+    /// When a document's timestamp differs from the first document in the current split
+    /// by more than this value, a new split is created.
+    /// Default: None (no time-based split boundary)
+    #[schema(value_type = Option<u64>)]
+    #[serde(default)]
+    pub max_time_range_secs: Option<u64>,
 }
 
 impl IndexingSettings {
@@ -158,6 +165,7 @@ impl Default for IndexingSettings {
             split_num_docs_target: Self::default_split_num_docs_target(),
             merge_policy: MergePolicyConfig::default(),
             resources: IndexingResources::default(),
+            max_time_range_secs: None,
         }
     }
 }

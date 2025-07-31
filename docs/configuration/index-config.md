@@ -582,6 +582,7 @@ This section describes indexing settings for a given index.
 | `merge_policy` | Describes the strategy used to trigger split merge operations (see [Merge policies](#merge-policies) section below). |
 | `resources.heap_size`      | Indexer heap size per source per index.   | `2000000000` |
 | `docstore_compression_level` | Level of compression used by zstd for the docstore. Lower values may increase ingest speed, at the cost of index size | `8` |
+| `max_time_range_secs` | Maximum time range in seconds that a split should span. When a document's timestamp differs from the first document in the current split by more than this value, a new split is created. This is useful for ensuring good time-based pruning when backfilling data with mixed timestamps. | `None` (no time-based split boundary) |
 | `docstore_blocksize` | Size of blocks in the docstore, in bytes. Lower values may improve doc retrieval speed, at the cost of index size | `1000000` |
 
 :::note
@@ -591,6 +592,26 @@ Choosing an appropriate commit timeout is critical. With a shorter commit timeou
 When decommissioning definitively an indexer node that received data through the ingest API (including the [Elastic bulk API](/docs/reference/es_compatible_api) and the OTEL [log](/docs/log-management/otel-service.md) and [trace](/docs/distributed-tracing/otel-service.md) services), we need to make sure that all the data that was persisted locally (Write Ahead Log) is indexed and committed. After receiving the termination signal, the Quickwit process waits for the indexing pipelines to finish processing this local data. This can take as long as the longest commit timeout of all indexes. Make sure that the termination grace period of the infrastructure supporting the Quickwit indexer nodes is long enough (e.g [`terminationGracePeriodSeconds`](https://kubernetes.io/docs/concepts/containers/container-lifecycle-hooks/) in Kubernetes or [`stopTimeout`](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_definition_parameters.html) on AWS ECS).
 
 :::
+
+### Time-based Split Boundaries
+
+The `max_time_range_secs` parameter is particularly useful when backfilling historical data or dealing with out-of-order timestamps. Here's an example configuration:
+
+```yaml
+version: 0.7
+index_id: "historical_logs"
+# ...
+indexing_settings:
+  split_num_docs_target: 10000000
+  max_time_range_secs: 86400  # 1 day - ensures each split spans at most 24 hours
+```
+
+Recommended values for different use cases:
+- **Backfilling historical data**: `86400` (1 day) - Creates daily splits for efficient time-based queries
+- **High-volume real-time data**: `3600` (1 hour) - Provides fine-grained time partitioning
+- **Mixed workloads**: `43200` (12 hours) - Balances between split size and query performance
+
+When this parameter is not set (default), splits are created based only on document count and memory limits, which can result in splits spanning very wide time ranges when processing out-of-order data.
 
 ### Merge policies
 

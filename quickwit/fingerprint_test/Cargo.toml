@@ -1,0 +1,9 @@
+[package]
+name = "fingerprint_test"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+siphasher = "1.0"

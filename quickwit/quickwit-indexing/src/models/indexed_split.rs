@@ -172,6 +172,7 @@ pub enum CommitTrigger {
     NoMoreDocs,
     NumDocsLimit,
     Timeout,
+    TimeRangeLimit,
 }
 
 #[derive(Debug)]

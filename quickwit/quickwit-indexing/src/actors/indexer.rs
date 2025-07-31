@@ -240,6 +240,8 @@ impl IndexerState {
             ),
             cooperative_indexing_period,
             split_builders_guard,
+            first_timestamp: None,
+            max_time_range_secs: self.indexing_settings.max_time_range_secs,
         };
         Ok(workbench)
     }
@@ -276,7 +278,7 @@ impl IndexerState {
         indexing_workbench_opt: &mut Option<IndexingWorkbench>,
         counters: &mut IndexerCounters,
         ctx: &ActorContext<Indexer>,
-    ) -> Result<(), ActorExitStatus> {
+    ) -> Result<bool, ActorExitStatus> {
         let IndexingWorkbench {
             checkpoint_delta,
             indexed_splits,
@@ -284,6 +286,8 @@ impl IndexerState {
             publish_lock,
             last_delete_opstamp,
             memory_usage,
+            first_timestamp,
+            max_time_range_secs,
             ..
         } = self
             .get_or_create_workbench(indexing_workbench_opt, ctx)
@@ -291,7 +295,7 @@ impl IndexerState {
         if publish_lock.is_dead() {
             // Release indexing permit early.
             indexing_workbench_opt.take();
-            return Ok(());
+            return Ok(false);
         }
         checkpoint_delta
             .source_delta
@@ -299,6 +303,7 @@ impl IndexerState {
             .context("batch delta does not follow indexer checkpoint")?;
         let mut memory_usage_delta: i64 = 0;
         counters.num_doc_batches_in_workbench += 1;
+        let mut should_commit_time_range = false;
         for doc in batch.docs {
             let ProcessedDoc {
                 doc,
@@ -306,6 +311,8 @@ impl IndexerState {
                 partition,
                 num_bytes,
             } = doc;
+            
+            
             counters.num_docs_in_workbench += 1;
             let (indexed_split, split_created) = self.get_or_create_indexed_split(
                 partition,
@@ -325,6 +332,28 @@ impl IndexerState {
             indexed_split.split_attrs.num_docs += 1;
             if let Some(timestamp) = timestamp_opt {
                 record_timestamp(timestamp, &mut indexed_split.split_attrs.time_range);
+                
+                // Track first timestamp if not set
+                if first_timestamp.is_none() {
+                    *first_timestamp = Some(timestamp);
+                }
+                
+                // Check if we need to commit due to time range
+                if let Some(max_range_secs) = *max_time_range_secs {
+                    if let Some(first_ts) = *first_timestamp {
+                        let current_ts = timestamp.into_timestamp_secs() as u64;
+                        let first_ts_secs = first_ts.into_timestamp_secs() as u64;
+                        let time_diff = if current_ts > first_ts_secs {
+                            current_ts - first_ts_secs
+                        } else {
+                            first_ts_secs - current_ts
+                        };
+                        
+                        if time_diff > max_range_secs {
+                            should_commit_time_range = true;
+                        }
+                    }
+                }
             }
             let _protect_guard = ctx.protect_zone();
             indexed_split
@@ -336,7 +365,7 @@ impl IndexerState {
             ctx.record_progress();
         }
         memory_usage.add(memory_usage_delta);
-        Ok(())
+        Ok(should_commit_time_range)
     }
 }
 
@@ -361,6 +390,10 @@ struct IndexingWorkbench {
     memory_usage: GaugeGuard<'static>,
     split_builders_guard: GaugeGuard<'static>,
     cooperative_indexing_period: Option<CooperativeIndexingPeriod>,
+    
+    // Time range tracking for splits
+    first_timestamp: Option<DateTime>,
+    max_time_range_secs: Option<u64>,
 }
 
 pub struct Indexer {
@@ -596,7 +629,7 @@ impl Indexer {
     ) -> Result<(), ActorExitStatus> {
         fail_point!("indexer:batch:before");
         let force_commit = batch.force_commit;
-        self.indexer_state
+        let should_commit_time_range = self.indexer_state
             .index_batch(
                 batch,
                 &mut self.indexing_workbench_opt,
@@ -619,6 +652,11 @@ impl Indexer {
             self.send_to_serializer(CommitTrigger::ForceCommit, ctx)
                 .await?;
         }
+        if should_commit_time_range {
+            self.send_to_serializer(CommitTrigger::TimeRangeLimit, ctx)
+                .await?;
+        }
+        
         fail_point!("indexer:batch:after");
         Ok(())
     }
@@ -717,6 +755,7 @@ mod tests {
 
     use super::*;
     use crate::actors::indexer::{IndexerCounters, record_timestamp};
+    use crate::models::{IndexedSplitBatchBuilder, EmptySplit};
 
     #[test]
     fn test_record_timestamp() {
@@ -1659,6 +1698,165 @@ mod tests {
             IndexCheckpointDelta::for_test("test-source", 4..8)
         );
 
+        universe.assert_quit().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_indexer_triggers_commit_on_time_range_limit() -> anyhow::Result<()> {
+        let index_uid = IndexUid::new_with_random_ulid("test-index");
+        let node_id = NodeId::from("test-node");
+        let pipeline_id = IndexingPipelineId {
+            index_uid: index_uid.clone(),
+            source_id: "test-source".to_string(),
+            node_id: node_id.clone(),
+            pipeline_uid: PipelineUid::default(),
+        };
+        
+        let doc_mapper_json = r#"{
+            "field_mappings": [
+                {"name": "body", "type": "text"},
+                {"name": "timestamp", "type": "datetime", "fast": true}
+            ]
+        }"#;
+        let doc_mapper: Arc<DocMapper> = Arc::new(
+            serde_json::from_str::<DocMapper>(doc_mapper_json).unwrap()
+        );
+        let schema = doc_mapper.schema();
+        let body_field = schema.get_field("body").unwrap();
+        let timestamp_field = schema.get_field("timestamp").unwrap();
+        
+        let indexing_directory = TempDirectory::for_test();
+        let mut indexing_settings = IndexingSettings::for_test();
+        indexing_settings.split_num_docs_target = 100; // High enough to not trigger
+        indexing_settings.max_time_range_secs = Some(3600); // 1 hour max range
+        
+        let universe = Universe::with_accelerated_time();
+        let (index_serializer_mailbox, index_serializer_inbox) = universe.create_test_mailbox();
+        let mut mock_metastore = MockMetastoreService::new();
+        mock_metastore
+            .expect_last_delete_opstamp()
+            .returning(move |_| Ok(LastDeleteOpstampResponse::new(10)));
+        
+        let indexer = Indexer::new(
+            pipeline_id.clone(),
+            doc_mapper,
+            MetastoreServiceClient::from_mock(mock_metastore),
+            indexing_directory,
+            indexing_settings,
+            None,
+            index_serializer_mailbox,
+        );
+        
+        let (indexer_mailbox, indexer_handle) = universe.spawn_builder().spawn(indexer);
+        
+        // Send first doc with timestamp at T0
+        let timestamp_0 = DateTime::from_timestamp_secs(1_000_000);
+        let doc_0 = doc!(
+            body_field => "doc 0",
+            timestamp_field => timestamp_0
+        );
+        let processed_doc_0 = ProcessedDoc {
+            doc: doc_0,
+            timestamp_opt: Some(timestamp_0),
+            partition: 0,
+            num_bytes: 10,
+        };
+        
+        // Send second doc with timestamp at T0 + 30 minutes (within limit)
+        let timestamp_1 = DateTime::from_timestamp_secs(1_001_800);
+        let doc_1 = doc!(
+            body_field => "doc 1",
+            timestamp_field => timestamp_1
+        );
+        let processed_doc_1 = ProcessedDoc {
+            doc: doc_1,
+            timestamp_opt: Some(timestamp_1),
+            partition: 0,
+            num_bytes: 10,
+        };
+        
+        // Send third doc with timestamp at T0 + 90 minutes (exceeds 1 hour limit)
+        // 1_000_000 + 90*60 = 1_000_000 + 5400 = 1_005_400
+        let timestamp_2 = DateTime::from_timestamp_secs(1_005_400);
+        let doc_2 = doc!(
+            body_field => "doc 2",
+            timestamp_field => timestamp_2
+        );
+        let processed_doc_2 = ProcessedDoc {
+            doc: doc_2,
+            timestamp_opt: Some(timestamp_2),
+            partition: 0,
+            num_bytes: 10,
+        };
+        
+        // Send first batch with docs within time range
+        indexer_mailbox
+            .send_message(ProcessedDocBatch::new(
+                vec![processed_doc_0, processed_doc_1],
+                SourceCheckpointDelta::from_range(0..2),
+                false,
+            ))
+            .await?;
+        
+        // Give some time to process
+        universe.sleep(Duration::from_millis(200)).await;
+        
+        // At this point, no split should be emitted yet
+        let messages_before = index_serializer_inbox.drain_for_test();
+        assert_eq!(messages_before.len(), 0, "Expected no splits before time range exceeded");
+        
+        // Send doc that exceeds time range
+        indexer_mailbox
+            .send_message(ProcessedDocBatch::new(
+                vec![processed_doc_2],
+                SourceCheckpointDelta::from_range(2..3),
+                false,
+            ))
+            .await?;
+        
+        // Wait for the indexer to process
+        universe.sleep(Duration::from_millis(100)).await;
+        
+        // Send an empty batch to ensure processing is complete
+        indexer_mailbox
+            .send_message(ProcessedDocBatch::new(
+                vec![],
+                SourceCheckpointDelta::from_range(3..4),
+                false,
+            ))
+            .await?;
+        
+        // Give time to process and trigger commit
+        universe.sleep(Duration::from_millis(500)).await;
+        
+        // Process any pending messages
+        let _ = indexer_handle.process_pending_and_observe().await;
+        
+        // Now a split should be emitted due to time range limit
+        // drain_for_test_typed will filter out non-matching types
+        let split_batches: Vec<IndexedSplitBatchBuilder> = index_serializer_inbox.drain_for_test_typed();
+        assert!(split_batches.len() >= 1, "Expected at least 1 split to be emitted, got {}", split_batches.len());
+        
+        // Find the split that was triggered by time range limit
+        let time_range_batch = split_batches.iter()
+            .find(|batch| batch.commit_trigger == CommitTrigger::TimeRangeLimit);
+            
+        assert!(time_range_batch.is_some(), "Expected a split triggered by TimeRangeLimit");
+        let split_batch = time_range_batch.unwrap();
+        
+        let split = &split_batch.splits[0];
+        assert_eq!(split.split_attrs.num_docs, 3); // All three docs are in the split
+        
+        // Verify the time range of the emitted split
+        let time_range = split.split_attrs.time_range.as_ref().unwrap();
+        assert_eq!(time_range.start().into_timestamp_secs(), 1_000_000);
+        assert_eq!(time_range.end().into_timestamp_secs(), 1_005_400); // Includes the doc that triggered the split
+        
+        let indexer_counters = indexer_handle.process_pending_and_observe().await.state;
+        assert_eq!(indexer_counters.num_splits_emitted, 1);
+        assert_eq!(indexer_counters.num_split_batches_emitted, 1);
+        
         universe.assert_quit().await;
         Ok(())
     }

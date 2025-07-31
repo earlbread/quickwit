@@ -1226,9 +1226,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_indexing_service_apply_plan() {
-        const PARAMS_FINGERPRINT_INGEST_API: u64 = 1637744865450232394;
-        const PARAMS_FINGERPRINT_SOURCE_1: u64 = 1705211905504908791;
-        const PARAMS_FINGERPRINT_SOURCE_2: u64 = 8706667372658059428;
+        const PARAMS_FINGERPRINT_INGEST_API: u64 = 6552940180832588537;
+        const PARAMS_FINGERPRINT_SOURCE_1: u64 = 18193242460754969595;
+        const PARAMS_FINGERPRINT_SOURCE_2: u64 = 7357412785290858125;
 
         quickwit_common::setup_logging_for_tests();
         let transport = ChannelTransport::default();
