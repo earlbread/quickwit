@@ -137,7 +137,15 @@ impl KinesisSource {
         shard_id: ShardId,
         checkpoint: &SourceCheckpoint,
     ) {
-        assert!(!self.state.shard_consumers.contains_key(&shard_id));
+        // Skip if we already have a consumer for this shard
+        if self.state.shard_consumers.contains_key(&shard_id) {
+            warn!(
+                stream_name = %self.stream_name,
+                shard_id = %shard_id,
+                "Shard consumer already exists, skipping spawn"
+            );
+            return;
+        }
 
         let partition_id = PartitionId::from(shard_id.as_str());
         let from_position = checkpoint
@@ -192,7 +200,24 @@ impl Source for KinesisSource {
             .await
             .context("failed to fetch checkpoint")?;
 
+        // Filter out closed shards - only create consumers for open/active shards
+        // A shard is closed if it has an ending sequence number
         for shard in shards {
+            // Check if shard is still open (no ending sequence number)
+            let is_open = shard.sequence_number_range
+                .as_ref()
+                .and_then(|range| range.ending_sequence_number.as_ref())
+                .is_none();
+            
+            if !is_open {
+                info!(
+                    stream_name = %self.stream_name,
+                    shard_id = %shard.shard_id,
+                    "Skipping closed shard - will not create consumer"
+                );
+                continue;
+            }
+            
             self.spawn_shard_consumer(ctx, shard.shard_id, &checkpoint);
         }
         info!(
@@ -220,8 +245,19 @@ impl Source for KinesisSource {
                         ShardConsumerMessage::ChildShards(shard_ids) => {
                             let checkpoint = self.source_runtime.fetch_checkpoint().await.context("failed to fetch checkpoint")?;
 
+                            // When a parent shard closes and has children, we need to transfer
+                            // the parent's checkpoint to the children so they can continue
+                            // from where the parent left off
                             for shard_id in shard_ids {
-                                self.spawn_shard_consumer(ctx, shard_id, &checkpoint);
+                                // Check if this child shard already has a consumer
+                                if !self.state.shard_consumers.contains_key(&shard_id) {
+                                    info!(
+                                        stream_name = %self.stream_name,
+                                        child_shard_id = %shard_id,
+                                        "Spawning consumer for child shard"
+                                    );
+                                    self.spawn_shard_consumer(ctx, shard_id, &checkpoint);
+                                }
                             }
                         }
                         ShardConsumerMessage::Records { shard_id, records, lag_millis } => {
@@ -364,8 +400,9 @@ mod tests {
     use super::*;
     use crate::models::RawDocBatch;
     use crate::source::SourceActor;
+    use crate::source::kinesis::api::list_shards;
     use crate::source::kinesis::helpers::tests::{
-        make_shard_id, put_records_into_shards, setup, teardown,
+        make_shard_id, put_records_into_shards, setup, teardown, DEFAULT_RETRY_PARAMS,
     };
     use crate::source::tests::SourceRuntimeBuilder;
 
