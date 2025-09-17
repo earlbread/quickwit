@@ -10,3 +10,11 @@ rustdocflags = ["--cfg", "tokio_unstable"]
 # AWS does not seem to disclose the exact CPUs they use.
 rustflags = ["-C", "target-cpu=x86-64-v2", "--cfg", "tokio_unstable"]
 
+[profile.test]
+debug = true
+opt-level = 0
+
+[profile.dev]
+debug = true
+opt-level = 0
+

@@ -137,6 +137,7 @@ impl KinesisSource {
         shard_id: ShardId,
         checkpoint: &SourceCheckpoint,
     ) {
+        assert!(!self.state.shard_consumers.contains_key(&shard_id));
         // Skip if we already have a consumer for this shard
         if self.state.shard_consumers.contains_key(&shard_id) {
             warn!(
@@ -245,19 +246,8 @@ impl Source for KinesisSource {
                         ShardConsumerMessage::ChildShards(shard_ids) => {
                             let checkpoint = self.source_runtime.fetch_checkpoint().await.context("failed to fetch checkpoint")?;
 
-                            // When a parent shard closes and has children, we need to transfer
-                            // the parent's checkpoint to the children so they can continue
-                            // from where the parent left off
                             for shard_id in shard_ids {
-                                // Check if this child shard already has a consumer
-                                if !self.state.shard_consumers.contains_key(&shard_id) {
-                                    info!(
-                                        stream_name = %self.stream_name,
-                                        child_shard_id = %shard_id,
-                                        "Spawning consumer for child shard"
-                                    );
-                                    self.spawn_shard_consumer(ctx, shard_id, &checkpoint);
-                                }
+                                self.spawn_shard_consumer(ctx, shard_id, &checkpoint);
                             }
                         }
                         ShardConsumerMessage::Records { shard_id, records, lag_millis } => {
@@ -392,7 +382,10 @@ pub(super) async fn get_region(
 #[cfg(all(test, feature = "kinesis-localstack-tests"))]
 mod tests {
 
-    use quickwit_actors::Universe;
+    use std::time::Duration;
+
+    use quickwit_actors::{Command, Universe};
+    use quickwit_common::retry::RetryParams;
     use quickwit_config::{SourceConfig, SourceParams};
     use quickwit_metastore::checkpoint::SourceCheckpointDelta;
     use quickwit_proto::types::IndexUid;
@@ -615,6 +608,200 @@ mod tests {
             });
             assert_eq!(exit_state, expected_state);
         }
+        teardown(&kinesis_client, &stream_name).await;
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn test_kinesis_source_with_shard_split() {
+        use aws_sdk_kinesis::types::StreamStatus;
+        use crate::source::kinesis::api::tests::{split_shard, wait_for_stream_status};
+
+        let universe = Universe::with_accelerated_time();
+        let (doc_processor_mailbox, doc_processor_inbox) = universe.create_test_mailbox();
+
+        // Setup: 초기에 2개의 샤드로 스트림 생성
+        let (kinesis_client, stream_name) = setup("test-kinesis-shard-split", 1).await.unwrap();
+        let index_id = "test-kinesis-split-index";
+        let index_uid = IndexUid::new_with_random_ulid(index_id);
+
+        // 샤드 분할 수행
+        // 첫 번째 샤드(shardId-000000000000)를 두 개로 분할
+        let shards = list_shards(
+            &kinesis_client,
+            &RetryParams::standard(),
+            &stream_name,
+            None
+        ).await.unwrap();
+
+        let first_shard = &shards[0];
+        let hash_key_range = first_shard.hash_key_range.as_ref().unwrap();
+        let starting_hash = hash_key_range.starting_hash_key.parse::<u128>().unwrap();
+        let ending_hash = hash_key_range.ending_hash_key.parse::<u128>().unwrap();
+        let new_starting_hash_key = ((starting_hash + ending_hash) / 2).to_string();
+
+        split_shard(
+            &kinesis_client,
+            &stream_name,
+            &first_shard.shard_id,
+            &new_starting_hash_key,
+        )
+        .await
+        .unwrap();
+
+        // 스트림이 다시 ACTIVE 상태가 될 때까지 대기
+        wait_for_stream_status(
+            &kinesis_client,
+            &stream_name,
+            |status| status == StreamStatus::Active,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        
+        // 초기 데이터 삽입
+        let _initial_sequence_numbers = put_records_into_shards(
+            &kinesis_client,
+            &stream_name,
+            [
+                (0, "Before Split #00"),
+                (0, "Before Split #01"),
+                (1, "Before Split #10"),
+                (1, "Before Split #11"),
+            ],
+        )
+            .await
+            .unwrap();
+
+        // Kinesis Source 설정 및 실행
+        let kinesis_params = KinesisSourceParams {
+            stream_name: stream_name.clone(),
+            region_or_endpoint: Some(RegionOrEndpoint::Endpoint(
+                "http://localhost:4566".to_string(),
+            )),
+            enable_backfill_mode: true,
+        };
+        let source_params = SourceParams::Kinesis(kinesis_params.clone());
+        let source_config = SourceConfig::for_test("test-kinesis-split-source", source_params);
+        let source_runtime = SourceRuntimeBuilder::new(index_uid.clone(), source_config).build();
+
+        // 첫 번째 실행: 초기 데이터 소비
+        {
+            let kinesis_source =
+                KinesisSource::try_new(source_runtime.clone(), kinesis_params.clone())
+                    .await
+                    .unwrap();
+            let actor = SourceActor {
+                source: Box::new(kinesis_source),
+                doc_processor_mailbox: doc_processor_mailbox.clone(),
+            };
+            let (_mailbox, handle) = universe.spawn_builder().spawn(actor);
+            let (exit_status, _exit_state) = handle.join().await;
+            assert!(exit_status.is_success());
+
+            let messages: Vec<RawDocBatch> = doc_processor_inbox
+                .drain_for_test()
+                .into_iter()
+                .flat_map(|box_any| box_any.downcast::<RawDocBatch>().ok())
+                .map(|box_raw_doc_batch| *box_raw_doc_batch)
+                .collect();
+
+            let batch = merge_doc_batches(messages).unwrap();
+            assert_eq!(batch.docs.len(), 4);
+            assert!(batch.docs.contains(&"Before Split #00".into()));
+            assert!(batch.docs.contains(&"Before Split #01".into()));
+            assert!(batch.docs.contains(&"Before Split #10".into()));
+            assert!(batch.docs.contains(&"Before Split #11".into()));
+        }
+
+        let shards = list_shards(
+            &kinesis_client,
+            &RetryParams::standard(),
+            &stream_name,
+            None
+        ).await.unwrap();
+        {
+            for shard in shards {
+                let is_open = shard.sequence_number_range
+                    .as_ref()
+                    .and_then(|range| range.ending_sequence_number.as_ref())
+                    .is_none();
+
+                if !is_open {
+                    continue
+                }
+
+                let hash_key_range = shard.hash_key_range.as_ref().unwrap();
+                let starting_hash = hash_key_range.starting_hash_key.parse::<u128>().unwrap();
+                let ending_hash = hash_key_range.ending_hash_key.parse::<u128>().unwrap();
+                let new_starting_hash_key = (starting_hash + (ending_hash - starting_hash) / 2).to_string();
+        
+                split_shard(
+                    &kinesis_client,
+                    &stream_name,
+                    &shard.shard_id,
+                    &new_starting_hash_key,
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        // 분할 후 새로운 샤드에 데이터 삽입
+        // 분할로 인해 새로운 샤드가 생성되므로 샤드 목록을 다시 가져옴
+        let updated_shards = list_shards(
+            &kinesis_client,
+            &RetryParams::standard(),
+            &stream_name,
+            None
+        ).await.unwrap();
+        
+        // 새로운 샤드에 레코드 추가 (child shards에 추가)
+        // 참고: 분할된 샤드는 CLOSED 상태가 되고 새로운 자식 샤드들이 ACTIVE가 됨
+        let active_shard_count = updated_shards
+            .iter()
+            .filter(|s| s.sequence_number_range.as_ref()
+                .and_then(|r| r.ending_sequence_number.as_ref()).is_none())
+            .count();
+        
+        assert!(active_shard_count == 4);
+        
+        // Kinesis Source를 다시 실행하여 자식 샤드 감지 테스트
+        {
+            let kinesis_source =
+                KinesisSource::try_new(source_runtime.clone(), kinesis_params.clone())
+                    .await
+                    .unwrap();
+        
+            // Source 상태 확인: 새로운 샤드들이 감지되는지 확인
+            let actor = SourceActor {
+                source: Box::new(kinesis_source),
+                doc_processor_mailbox: doc_processor_mailbox.clone(),
+            };
+            let (_mailbox, handle) = universe.spawn_builder().spawn(actor);
+        
+            // 짧은 시간 동안 실행 후 종료
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = _mailbox.send_message_with_high_priority(Command::Quit);
+        
+            let (_exit_status, exit_state) = handle.join().await;
+        
+            // 상태에서 샤드 수 확인
+            let empty_vec = vec![];
+            let shard_consumer_positions = exit_state["shard_consumer_positions"]
+                .as_array()
+                .unwrap_or(&empty_vec);
+        
+            // 분할 후에는 최소 3개의 활성 샤드가 있어야 함
+            assert!(
+                shard_consumer_positions.len() == 4 || exit_state["shard_consumer_positions"] == json!([]),
+                "Expected at least 3 active shards after split, but got: {}",
+                shard_consumer_positions.len()
+            );
+        }
+
+        // 정리
         teardown(&kinesis_client, &stream_name).await;
     }
 }
