@@ -137,7 +137,15 @@ impl KinesisSource {
         shard_id: ShardId,
         checkpoint: &SourceCheckpoint,
     ) {
-        assert!(!self.state.shard_consumers.contains_key(&shard_id));
+        // assert!(!self.state.shard_consumers.contains_key(&shard_id));
+        if self.state.shard_consumers.contains_key(&shard_id) {
+            info!(
+                stream_name = %self.stream_name,
+                shard_id = %shard_id,
+                "Shard consumer already exists, skipping creation."
+            );
+            return;
+        }
 
         let partition_id = PartitionId::from(shard_id.as_str());
         let from_position = checkpoint
@@ -382,6 +390,95 @@ mod tests {
         }
         merged_batch.docs.sort();
         Ok(merged_batch)
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn test_kinesis_source_handles_resharding_with_split() {
+        use crate::source::kinesis::helpers::tests::{wait_for_active_stream};
+        use crate::source::kinesis::api::tests::{split_shard};
+
+        let universe = Universe::with_accelerated_time();
+        let (doc_processor_mailbox, doc_processor_inbox) = universe.create_test_mailbox();
+        let (kinesis_client, stream_name) = setup("test-resharding-split", 1).await.unwrap();
+        let index_id = "test-kinesis-resharding-index";
+        let index_uid = IndexUid::new_with_random_ulid(index_id);
+
+        // Send messages before split
+        let _ = put_records_into_shards(&kinesis_client, &stream_name, [(0, "Message before split")])
+            .await
+            .unwrap();
+
+        // Split the shard (1 -> 2 shards)
+        let shard_id_0 = make_shard_id(0);
+        split_shard(
+            &kinesis_client,
+            &stream_name,
+            &shard_id_0,
+            "85070591730234615865843651857942052864",
+        )
+        .await
+        .unwrap();
+        let shard_id_1 = make_shard_id(1);
+        let shard_id_2 = make_shard_id(2);
+
+        let _ = put_records_into_shards(
+            &kinesis_client,
+            &stream_name,
+            [(1, "Message after split 1"), (2, "Message after split 2")])
+            .await
+            .unwrap();
+
+        // Wait for stream to be active after split
+        let _ = wait_for_active_stream(&kinesis_client, &stream_name).await.unwrap();
+
+        // Initialize source after split
+        let kinesis_params = KinesisSourceParams {
+            stream_name: stream_name.clone(),
+            region_or_endpoint: Some(RegionOrEndpoint::Endpoint(
+                "http://localhost:4566".to_string(),
+            )),
+            enable_backfill_mode: true,
+        };
+        let source_params = SourceParams::Kinesis(kinesis_params.clone());
+        let source_config = SourceConfig::for_test("test-kinesis-resharding", source_params);
+        let source_runtime = SourceRuntimeBuilder::new(index_uid, source_config).build();
+
+        let kinesis_source = KinesisSource::try_new(source_runtime, kinesis_params)
+            .await
+            .unwrap();
+
+        let actor = SourceActor {
+            source: Box::new(kinesis_source),
+            doc_processor_mailbox: doc_processor_mailbox.clone(),
+        };
+        let (_mailbox, handle) = universe.spawn_builder().spawn(actor);
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Terminate the source
+        let (exit_status, _exit_state) = handle.join().await;
+        assert!(exit_status.is_success());
+
+        // Check that we received the message
+        let messages: Vec<RawDocBatch> = doc_processor_inbox
+            .drain_for_test()
+            .into_iter()
+            .flat_map(|box_any| box_any.downcast::<RawDocBatch>().ok())
+            .map(|box_raw_doc_batch| *box_raw_doc_batch)
+            .collect();
+
+        assert!(!messages.is_empty());
+
+        let batch = merge_doc_batches(messages).unwrap();
+        let expected_docs = vec![
+            "Message before split",
+            "Message after split 1",
+            "Message after split 2",
+        ];
+        assert_eq!(batch.docs, expected_docs);
+
+        teardown(&kinesis_client, &stream_name).await;
     }
 
     #[ignore]
