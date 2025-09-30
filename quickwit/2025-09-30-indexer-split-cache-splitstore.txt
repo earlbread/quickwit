@@ -1,0 +1,490 @@
+
+ ▐▛███▜▌   Claude Code v2.0.0
+▝▜█████▛▘  Sonnet 4.5 · Claude Max
+  ▘▘ ▝▝    /Users/earlbread/other-projects/quickwit/quickwit
+
+> indexer-split-cache 디렉토리에 대한 캐시 크기 제한은 split_store_max_num_bytes 옵션을 통해 제한할 수 있어. indexing 디렉토리는 어떻게 제한할 수 있을까? 
+
+⏺ indexer-split-cache와 indexing 디렉토리 관련 설정을 찾아보겠습니다.
+
+⏺ Search(pattern: "indexing.*directory|indexing.*cache|indexing.*size|indexing.*limit")
+  ⎿  Found 20 files (ctrl+o to expand)
+
+⏺ Search(pattern: "indexing_max_num_bytes|indexing.*max.*bytes|indexing_cache")
+  ⎿  Found 0 files 
+
+⏺ Read(~/other-projects/quickwit/docs/operating/data-directory.md)
+  ⎿  Read 121 lines (ctrl+o to expand)
+
+⏺ Search(pattern: "IndexerConfig|IndexingSettings", head_limit: 20)
+  ⎿  Found 20 files (ctrl+o to expand)
+
+⏺ Read(quickwit-config/src/node_config/mod.rs)
+  ⎿  Read 100 lines (ctrl+o to expand)
+
+⏺ Search(pattern: "struct IndexerConfig", output_mode: "content")
+  ⎿  Found 21 lines (ctrl+o to expand)
+
+⏺ 현재 indexing 디렉토리에 대한 직접적인 크기 제한 설정은 없는 것으로 보입니다. IndexerConfig에는 split_store_max_num_bytes와 split_store_max_num_splits 설정이 있지만, 이는 /cache/splits 디렉토리(indexer-split-cache)를 위한 설정입니다.
+
+  /indexing 디렉토리는 각 인덱싱 소스의 로컬 작업 디렉토리로, 현재 처리 중인 데이터를 저장하는 임시 공간입니다. 이 디렉토리의 크기를 제한하는 직접적인 설정 옵션은 제공되지 않습니다.
+
+> 그럼 무한히 디스크를 사용하다가 디스크가 꽉차면 어떻게해? 
+
+⏺ 좋은 지적입니다. indexing 디렉토리가 무한정 커지면 디스크가 가득 찰 수 있는 위험이 있습니다. 관련 코드를 살펴보겠습니다.
+
+⏺ Search(pattern: "disk.*full|disk.*space|no.*space|storage.*full|ENOSPC", head_limit: 20)
+  ⎿  Found 20 files (ctrl+o to expand)
+
+⏺ Search(pattern: "indexing.*directory.*clean|indexing.*gc|indexing.*cleanup|garbage.*collect")
+  ⎿  Found 24 files (ctrl+o to expand)
+
+⏺ Read(quickwit-indexing/src/actors/indexing_service.rs)
+  ⎿  Read 100 lines (ctrl+o to expand)
+
+⏺ Search(pattern: "cleanup.*indexing|clean.*indexing.*directory|garbage.*indexing", output_mode: "content")
+  ⎿  Found 0 lines 
+
+⏺ Search(pattern: "fn cleanup|clean_up|garbage_collect", path: "quickwit-indexing", output_mode: "content", head_limit: 30)
+  ⎿  Found 0 lines 
+
+⏺ Search(pattern: "temp_dir|indexing_directory|scratch_directory", path: "quickwit-indexing/src/actors/indexing_service.rs", output_mode: "content")
+  ⎿  Found 121 lines (ctrl+o to expand)
+
+⏺ Search(pattern: "create_or_purge_directory", path: "quickwit-common", output_mode: "content")
+  ⎿  Found 16 lines (ctrl+o to expand)
+
+⏺ 이제 중요한 부분을 찾았습니다!
+
+  IndexingService가 시작될 때 /indexing 디렉토리를 create_or_purge_directory로 초기화합니다 (indexing_service.rs:156). 이 함수는 디렉토리가 이미 존재하면 내용을 모두 삭제하고 다시 생성합니다.
+
+  따라서:
+
+  1. 서비스 재시작 시: IndexingService가 시작될 때마다 /indexing 디렉토리가 완전히 비워집니다. 이는 임시 작업 공간이므로 재시작 시 이전 데이터를 보존할 필요가 없습니다.
+  2. 실행 중 디스크 가득 참: 현재 코드에는 실행 중 디스크 사용량을 모니터링하거나 제한하는 메커니즘이 없습니다. 디스크가 가득 차면 인덱싱 작업이 실패하게 됩니다.
+  3. 해결 방법:
+    - 정기적으로 서비스를 재시작하여 임시 파일 정리
+    - 디스크 사용량을 외부에서 모니터링
+    - 충분한 디스크 공간 확보
+    - 인덱싱 파이프라인이 정상적으로 완료되면 임시 파일은 자동으로 정리되므로, 파이프라인이 정상 작동하는지 확인
+
+  현재 Quickwit에는 /indexing 디렉토리에 대한 직접적인 크기 제한 기능이 없으며, 서비스 재시작 시에만 완전히 정리됩니다.
+
+> 카프카로 지속적으로 컨슘하는데 임시 파일은 언제 정리 돼? 
+
+⏺ 좋은 질문입니다! Kafka처럼 지속적으로 데이터를 컨슘하는 경우 임시 파일이 언제 정리되는지 확인해보겠습니다.
+
+⏺ Search(pattern: "commit.*split|publish.*split|upload.*split", path: "quickwit-indexing/src/actors")
+  ⎿  Found 9 files (ctrl+o to expand)
+
+⏺ Search(pattern: "delete.*file|remove.*file|cleanup|clean_up|purge", path: "quickwit-indexing/src/actors/indexer.rs", output_mode: "content")
+  ⎿  Found 0 lines 
+
+⏺ Search(pattern: "ScratchDirectory|scratch_directory", path: "quickwit-indexing")
+  ⎿  Found 9 files (ctrl+o to expand)
+
+⏺ Read(quickwit-indexing/src/models/indexed_split.rs)
+  ⎿  Read 100 lines (ctrl+o to expand)
+
+⏺ Search(pattern: "TempDirectory.*Drop|impl Drop for", path: "quickwit-common/src/temp_dir.rs", output_mode: "content")
+  ⎿  Found 0 lines 
+
+⏺ Read(quickwit-common/src/temp_dir.rs)
+  ⎿  Read 100 lines (ctrl+o to expand)
+
+⏺ Search(pattern: "commit_timeout|commit_interval|split_commit", path: "quickwit-indexing", head_limit: 10)
+  ⎿  Found 4 files (ctrl+o to expand)
+
+⏺ Search(pattern: "COMMIT_TIMEOUT|commit_timeout_secs|IndexingSettings", path: "quickwit-indexing/src/actors/indexer.rs", output_mode: "content")
+  ⎿  Found 168 lines (ctrl+o to expand)
+
+⏺ Search(pattern: "commit_timeout|COMMIT", path: "quickwit-config/src/index_config/mod.rs", output_mode: "content")
+  ⎿  Found 76 lines (ctrl+o to expand)
+
+⏺ Kafka로 지속적으로 데이터를 컨슘할 때 임시 파일이 정리되는 시점은:
+
+  1. commit_timeout_secs (기본값: 60초) - 매 60초마다 split이 commit되어 스토리지로 업로드됩니다. 업로드가 완료되면 해당 split의 로컬 임시 파일은 삭제됩니다.
+  2. split_num_docs_target에 도달 시 - 설정된 문서 수에 도달하면 즉시 split을 commit하고 업로드합니다.
+  3. TempDirectory가 Drop될 때 - 각 split은 TempDirectory 구조체로 관리되며, split 처리가 완료되어 이 객체가 drop되면 디렉토리가 자동으로 삭제됩니다.
+
+  따라서 Kafka처럼 지속적으로 데이터가 들어오는 경우:
+  - 정상 작동 시: 60초마다 또는 문서 수 제한에 도달할 때마다 split이 업로드되고 임시 파일이 정리됨
+  - 문제 발생 시: 업로드 실패, 네트워크 문제 등으로 split이 계속 로컬에 쌓일 수 있음
+  - 서비스 재시작: /indexing 디렉토리 전체가 비워짐
+
+  결론적으로, 정상적으로 작동한다면 주기적으로 정리되지만, 장애 상황에서는 디스크가 가득 찰 위험이 있습니다.
+
+> downloaded-splits 디렉토리는 언제 정리 돼? 
+
+⏺ downloaded-splits 디렉토리의 정리 시점을 확인해보겠습니다.
+
+⏺ Search(pattern: "downloaded-splits|downloaded_splits")
+  ⎿  Found 4 files (ctrl+o to expand)
+
+⏺ Read(quickwit-indexing/src/models/merge_scratch.rs)
+  ⎿  Read 30 lines (ctrl+o to expand)
+
+⏺ Read(quickwit-indexing/src/actors/merge_split_downloader.rs)
+  ⎿  Read 150 lines (ctrl+o to expand)
+
+⏺ Search(pattern: "MergeScratch.*Drop|impl Drop.*MergeScratch|downloaded_splits_directory.*drop", path: "quickwit-indexing", output_mode: "content")
+  ⎿  Found 0 lines 
+
+⏺ Search(pattern: "merge_scratch_directory|merge.*complete|merge.*finish", path: "quickwit-indexing/src/actors/merge_executor.rs", output_mode: "content", head_limit: 30)
+  ⎿  Found 30 lines (ctrl+o to expand)
+
+⏺ downloaded-splits 디렉토리는 다음과 같이 정리됩니다:
+
+  1. Merge 작업 완료 시 자동 삭제:
+    - downloaded_splits_directory는 MergeScratch 구조체의 TempDirectory 필드입니다
+    - MergeScratch가 drop될 때 (merge 작업이 완료되거나 실패할 때) 자동으로 삭제됩니다
+    - TempDirectory는 Rust의 RAII 패턴을 사용하여 스코프를 벗어나면 자동으로 디렉토리를 삭제합니다
+  2. 디렉토리 구조:
+  /indexing/
+    └── merge/
+        └── downloaded-splits/  <- merge 완료 시 자동 삭제
+  3. 정리 시점:
+    - 정상 완료: Merge 작업이 성공하고 새로운 split이 업로드되면 즉시 삭제
+    - 실패 시: Merge 작업이 실패해도 MergeScratch 객체가 drop되면서 삭제
+    - 서비스 재시작: /indexing 전체가 비워지므로 함께 삭제
+
+  따라서 downloaded-splits는 merge 작업 단위로 관리되어, 각 merge 작업이 끝나면 (성공/실패 여부와 관계없이) 자동으로 정리됩니다. 이는 indexer-split-cache와 달리 임시 작업 공간으로만 사용되고 즉시 정리되는 구조입니다.
+
+> 정리되지 않고 계속 split 크기가 증가되는 이유는 뭘까? 
+
+⏺ split 크기가 계속 증가하는 원인을 찾아보겠습니다.
+
+⏺ Search(pattern: "fetch_and_open_split|fetch_split|get_split", path: "quickwit-indexing/src/split_store")
+  ⎿  Found 2 files (ctrl+o to expand)
+
+⏺ Read(quickwit-indexing/src/split_store/indexing_split_store.rs)
+  ⎿  Read 150 lines (ctrl+o to expand)
+
+⏺ Read(quickwit-indexing/src/split_store/indexing_split_cache.rs)
+  ⎿  Read 150 lines (ctrl+o to expand)
+
+⏺ Search(pattern: "get_cached_split|move_out", path: "quickwit-indexing/src/split_store/indexing_split_cache.rs", output_mode: "content", head_limit: 30)
+  ⎿  Found 30 lines (ctrl+o to expand)
+
+⏺ split 크기가 계속 증가하는 이유를 찾았습니다:
+
+  1. get_cached_split 호출 시 캐시에서 제거:
+    - Merge 작업을 위해 split을 가져올 때, 캐시에서 move_out으로 이동시킵니다
+    - 이는 "optimistically assume that this is for a merge operation that will be successful" 라고 코드에 명시되어 있습니다
+  2. 문제 상황:
+    - Merge가 실패하거나 중단되면 split이 캐시에서 제거되었지만 다시 돌아오지 않습니다
+    - 다음 merge 시도 시 캐시 미스가 발생하고, remote storage에서 다시 다운로드합니다
+    - 이렇게 다운로드된 split은 downloaded-splits 디렉토리에 저장됩니다
+  3. 누적되는 경우:
+    - Merge 작업이 반복적으로 실패하거나
+    - Merge 작업이 매우 느리게 진행되거나
+    - 네트워크/스토리지 문제로 split 업로드가 실패하는 경우
+  4. 캐시 제한이 적용되지 않는 이유:
+    - downloaded-splits는 캐시 외부의 임시 디렉토리입니다
+    - split_store_max_num_bytes 제한은 캐시에만 적용됩니다
+    - 따라서 merge 작업 중 다운로드된 split들은 이 제한에 영향받지 않습니다
+
+  해결 방법:
+  - Merge 작업이 정상적으로 완료되는지 확인
+  - 네트워크/스토리지 연결 상태 확인
+  - Merge 정책 조정 (너무 자주 또는 너무 큰 merge 방지)
+  - 충분한 디스크 공간 확보
+
+> download-split 폴더가 지워지는 코드가 어디에 있어? 
+
+⏺ downloaded-splits 폴더가 지워지는 정확한 코드를 찾아보겠습니다.
+
+⏺ Read(quickwit-common/src/temp_dir.rs)
+  ⎿  Read 442 lines (ctrl+o to expand)
+
+⏺ Search(pattern: "impl Drop.*TempDirectory|drop.*TempDirectory", path: "quickwit-common/src/temp_dir.rs", output_mode: "content")
+  ⎿  Found 0 lines 
+
+⏺ Search(pattern: "MergeScratch|merge_scratch", path: "quickwit-indexing/src/actors/merge_executor.rs", output_mode: "content", head_limit: 40)
+  ⎿  Found 40 lines (ctrl+o to expand)
+
+⏺ Read(quickwit-indexing/src/actors/merge_executor.rs)
+  ⎿  Read 100 lines (ctrl+o to expand)
+
+⏺ 핵심 코드를 찾았습니다:
+
+  정리되는 메커니즘:
+
+  1. tempfile 크레이트에 의존: TempDirectory는 Rust의 tempfile::TempDir을 Arc로 감싸고 있으며, 명시적인 Drop 구현이 없습니다. (temp_dir.rs:38-43)
+  2. 자동 삭제: TempDir의 Drop 구현(tempfile 크레이트)이 디렉토리를 자동으로 삭제합니다. 테스트 코드에서 확인 가능합니다 (temp_dir.rs:384-413):
+  drop(directory);
+  assert!(!path.try_exists().unwrap()); // drop 후 디렉토리가 사라짐
+  3. MergeScratch 처리 완료 시: MergeExecutor::handle() 함수가 끝나면 merge_scratch 변수가 drop되고, 이때 downloaded_splits_directory와 merge_scratch_directory가 삭제됩니다. (merge_executor.rs:85-163)
+
+  정리되지 않는 경우:
+
+  1. Merge 실패 시 조기 반환 (merge_executor.rs:105-118):
+  Err(err) => {
+      error!(task=?merge_task, err=?err, "failed to merge splits");
+      return Ok(()); // 여기서 merge_scratch가 drop되어야 함
+  }
+  2. 문제 가능성:
+    - tantivy_dirs가 파일을 열어둔 상태에서 drop되어 디렉토리 삭제 실패
+    - Actor가 무한정 대기하거나 멈춰서 handle 함수가 완료되지 않음
+    - Arc reference count가 0이 되지 않음
+    - OS 레벨에서 디렉토리 삭제 실패 (권한, 열린 파일 등)
+
+  실제로 로그를 확인해보면 merge 작업이 완료/실패하는지 알 수 있습니다. "failed to merge splits" 에러가 계속 발생하거나, merge 작업이 완료되지 않고 멈춰있을 가능성이 높습니다.
+
+> 테스트에서 머지 완료후 downloaded_splits_directory가 삭제되는지 확인하고 있을까? 
+
+⏺ 테스트에서 downloaded_splits_directory 삭제를 검증하는지 확인해보겠습니다.
+
+⏺ Search(pattern: "test.*merge|#\[tokio::test\]", path: "quickwit-indexing/src/actors/merge_executor.rs", output_mode: "content")
+  ⎿  Found 40 lines (ctrl+o to expand)
+
+⏺ Read(quickwit-indexing/src/actors/merge_executor.rs)
+  ⎿  Read 100 lines (ctrl+o to expand)
+
+⏺ Read(quickwit-indexing/src/actors/merge_split_downloader.rs)
+  ⎿  Read 78 lines (ctrl+o to expand)
+
+⏺ Search(pattern: "try_exists|assert.*exist|drop.*directory", path: "quickwit-indexing/src/actors", output_mode: "content")
+  ⎿  Found 15 lines (ctrl+o to expand)
+
+⏺ 테스트 코드를 분석한 결과:
+
+  검증하지 않습니다.
+
+  테스트의 문제점:
+
+  1. test_merge_executor (merge_executor.rs:599-687):
+    - downloaded_splits_directory 생성 (line 632-633)
+    - Merge 실행 (line 670)
+    - 결과만 검증 (num_docs, size 등)
+    - 디렉토리 삭제 여부는 검증하지 않음
+  2. test_merge_split_downloader (merge_split_downloader.rs:142-204):
+    - Split 다운로드 후 파일 존재만 확인 (line 200)
+    - MergeScratch가 drop된 후 디렉토리 삭제는 검증하지 않음
+  3. 오직 TempDirectory 유닛 테스트만 (temp_dir.rs:384-440):
+  drop(directory);
+  assert!(!path.try_exists().unwrap()); // 삭제 확인
+  3. 여기서만 디렉토리가 실제로 삭제되는지 검증합니다.
+
+  문제의 핵심:
+  - 통합 테스트에서 실제 merge 워크플로우에서 디렉토리가 정리되는지 검증하지 않음
+  - tantivy_dirs가 파일을 열어둔 상태에서 drop될 때 디렉토리 삭제가 실패할 수 있는데, 이를 테스트가 감지하지 못함
+  - 프로덕션에서 발생하는 "디렉토리가 삭제되지 않는" 문제를 테스트로 재현할 수 없음
+
+  실제 프로덕션에서 downloaded-splits가 누적되고 있다면, 이는 테스트 커버리지 부족으로 인해 발견되지 않은 버그일 가능성이 높습니다.
+
+> 머지 테스트에서 디렉토리가 삭제되는지 검증하려면 어떻게 해야할까? 
+
+⏺ merge 테스트에서 디렉토리 삭제를 검증하려면:
+
+  #[tokio::test]
+  async fn test_merge_executor() -> anyhow::Result<()> {
+      // ... 기존 setup 코드 ...
+
+      let merge_scratch_directory = TempDirectory::for_test();
+      let downloaded_splits_directory =
+          merge_scratch_directory.named_temp_child("downloaded-splits-")?;
+
+      // 1. 경로를 미리 저장
+      let merge_scratch_path = merge_scratch_directory.path().to_path_buf();
+      let downloaded_splits_path = downloaded_splits_directory.path().to_path_buf();
+
+      // 2. 디렉토리가 생성되었는지 확인
+      assert!(merge_scratch_path.try_exists().unwrap());
+      assert!(downloaded_splits_path.try_exists().unwrap());
+
+      let merge_scratch = MergeScratch {
+          merge_task,
+          tantivy_dirs,
+          merge_scratch_directory,
+          downloaded_splits_directory,
+      };
+
+      // ... merge 실행 ...
+      merge_executor_mailbox.send_message(merge_scratch).await?;
+      merge_executor_handle.process_pending_and_observe().await;
+
+      // 3. Actor가 처리를 완료한 후 디렉토리가 삭제되었는지 확인
+      assert!(!downloaded_splits_path.try_exists().unwrap(),
+              "downloaded_splits_directory should be deleted after merge");
+      assert!(!merge_scratch_path.try_exists().unwrap(),
+              "merge_scratch_directory should be deleted after merge");
+
+      // ... 나머지 검증 코드 ...
+      Ok(())
+  }
+
+  핵심 포인트:
+  1. path().to_path_buf()로 경로를 복사해서 저장 (TempDirectory가 drop되어도 경로는 남음)
+  2. Actor 처리 완료 후 try_exists()로 삭제 확인
+  3. 실패 시 명확한 에러 메시지
+
+  이 방식으로 실제로 디렉토리가 정리되지 않는 버그를 발견할 수 있습니다.
+
+> 테스트를 그렇게 변경해줘 
+
+⏺ 테스트를 수정하겠습니다.
+
+⏺ Read(quickwit-indexing/src/actors/merge_executor.rs)
+  ⎿  Read 88 lines (ctrl+o to expand)
+
+⏺ Update(quickwit-indexing/src/actors/merge_executor.rs)
+  ⎿  Updated quickwit-indexing/src/actors/merge_executor.rs with 9 additions                        
+       631            let merge_scratch_directory = TempDirectory::for_test();
+       632            let downloaded_splits_directory =
+       633                merge_scratch_directory.named_temp_child("downloaded-splits-")?;
+       634 +  
+       635 +          // Save paths before moving into MergeScratch to verify cleanup later
+       636 +          let merge_scratch_path = merge_scratch_directory.path().to_path_buf();
+       637 +          let downloaded_splits_path = downloaded_splits_directory.path().to_path_buf();
+       638 +  
+       639 +          // Verify directories exist
+       640 +          assert!(merge_scratch_path.try_exists().unwrap());
+       641 +          assert!(downloaded_splits_path.try_exists().unwrap());
+       642 +  
+       643            let mut tantivy_dirs: Vec<Box<dyn Directory>> = Vec::new();
+       644            for split_meta in &split_metas {
+       645                let split_filename = split_file(split_meta.split_id());
+
+⏺ Update(quickwit-indexing/src/actors/merge_executor.rs)
+  ⎿  Updated quickwit-indexing/src/actors/merge_executor.rs with 11 additions                                 
+       678                .spawn(merge_executor);
+       679            merge_executor_mailbox.send_message(merge_scratch).await?;
+       680            merge_executor_handle.process_pending_and_observe().await;
+       681 +  
+       682 +          // Verify directories are cleaned up after merge
+       683 +          assert!(
+       684 +              !downloaded_splits_path.try_exists().unwrap(),
+       685 +              "downloaded_splits_directory should be deleted after merge"
+       686 +          );
+       687 +          assert!(
+       688 +              !merge_scratch_path.try_exists().unwrap(),
+       689 +              "merge_scratch_directory should be deleted after merge"
+       690 +          );
+       691 +  
+       692            let packager_msgs: Vec<IndexedSplitBatch> = merge_packager_inbox.drain_for_test_typed();
+       693            assert_eq!(packager_msgs.len(), 1);
+       694            let split_attrs_after_merge = &packager_msgs[0].splits[0].split_attrs;
+
+⏺ 테스트를 수정했습니다. 이제 test_merge_executor는:
+
+  1. 디렉토리 경로 저장 (line 636-637): merge_scratch로 move되기 전에 경로를 복사
+  2. 생성 확인 (line 640-641): 디렉토리가 제대로 생성되었는지 확인
+  3. 삭제 확인 (line 683-690): merge 완료 후 디렉토리가 삭제되었는지 검증
+
+  이 테스트를 실행하면 실제로 디렉토리가 정리되지 않는 버그를 발견할 수 있습니다. 테스트를 실행해볼까요?
+
+> cargo test -p quickwit-indexing test_merge_executor 
+
+⏺ Bash(cargo test -p quickwit-indexing test_merge_executor)
+  ⎿  Error: error: could not find `Cargo.toml` in `/Users/earlbread/other-projects/quickwit` or any parent directory
+
+⏺ Bash(ls -la)
+  ⎿  total 416                                                      
+     -rw-r--r--   1 earlbread  staff    113 May 19 17:57 _typos.toml
+     drwxr-xr-x  33 earlbread  staff   1056 Sep 30 10:14 .
+     … +31 lines (ctrl+o to expand)
+
+⏺ Bash(cd quickwit && cargo test -p quickwit-indexing test_merge_executor)
+  ⎿  Error: Finished `test` profile [unoptimized] target(s) in 0.88s
+          Running unittests src/lib.rs (target/debug/deps/quickwit_indexing-1bb23ec2b1b4181b)
+     error: test failed, to rerun pass `-p quickwit-indexing --lib`
+
+
+     running 1 test
+     test actors::merge_executor::tests::test_merge_executor ... FAILED
+
+     failures:
+
+     … +11 lines (ctrl+o to see all)
+
+⏺ 완벽합니다! 버그를 발견했습니다.
+
+  테스트 결과:
+  - downloaded_splits_directory는 삭제됨 (line 684 통과)
+  - merge_scratch_directory는 삭제되지 않음 (line 687 실패)
+
+  원인 분석:
+
+  merge_scratch_directory가 삭제되지 않는 이유를 확인해봅시다:
+
+⏺ Search(pattern: "IndexedSplit.*scratch|split_scratch_directory", path: "quickwit-indexing/src/models/indexed_split.rs", output_mode: "content")
+  ⎿  Found 86 lines (ctrl+o to expand)
+
+⏺ 원인을 찾았습니다!
+
+  문제:
+  IndexedSplit이 split_scratch_directory를 소유하고 있고, 이는 merge_scratch_directory의 child입니다. (indexed_split.rs:43)
+
+  테스트에서 packager_msgs가 IndexedSplit을 포함하고 있어서, IndexedSplit의 split_scratch_directory가 아직 drop되지 않았습니다.
+
+  TempDirectory의 named_temp_child는 parent에 대한 Arc 참조를 유지하므로 (temp_dir.rs:42), child가 살아있는 동안 parent인 merge_scratch_directory도 삭제되지 않습니다.
+
+  해결 방법:
+
+  테스트를 수정해서 packager_msgs를 먼저 drop시켜야 합니다:
+
+⏺ Update(quickwit-indexing/src/actors/merge_executor.rs)
+  ⎿  Updated quickwit-indexing/src/actors/merge_executor.rs with 12 additions and 5 removals                  
+       679            merge_executor_mailbox.send_message(merge_scratch).await?;
+       680            merge_executor_handle.process_pending_and_observe().await;
+       681    
+       682 -          // Verify directories are cleaned up after merge
+       682 +          // Verify downloaded_splits_directory is cleaned up
+       683            assert!(
+       684                !downloaded_splits_path.try_exists().unwrap(),
+       685                "downloaded_splits_directory should be deleted after merge"
+       686            );
+       687 -          assert!(
+       688 -              !merge_scratch_path.try_exists().unwrap(),
+       689 -              "merge_scratch_directory should be deleted after merge"
+       690 -          );
+       687    
+       688 +          // Verify merge results
+       689            let packager_msgs: Vec<IndexedSplitBatch> = merge_packager_inbox.drain_for_test_typed();
+       690            assert_eq!(packager_msgs.len(), 1);
+       691            let split_attrs_after_merge = &packager_msgs[0].splits[0].split_attrs;
+     ...
+       702                .try_into()?;
+       703            let searcher = reader.searcher();
+       704            assert_eq!(searcher.segment_readers().len(), 1);
+       705 +  
+       706 +          // Drop packager_msgs to release IndexedSplit which holds a reference to
+       707 +          // merge_scratch_directory through split_scratch_directory
+       708 +          drop(packager_msgs);
+       709 +  
+       710 +          // Now verify merge_scratch_directory is cleaned up after all references are dropped
+       711 +          assert!(
+       712 +              !merge_scratch_path.try_exists().unwrap(),
+       713 +              "merge_scratch_directory should be deleted after all splits are dropped"
+       714 +          );
+       715            test_sandbox.assert_quit().await;
+       716            Ok(())
+       717        }
+
+⏺ Bash(cd quickwit && cargo test -p quickwit-indexing test_merge_executor)
+  ⎿  running 1 test                                                
+     test actors::merge_executor::tests::test_merge_executor ... ok
+     … +4 lines (ctrl+o to expand)
+
+⏺ 테스트가 통과했습니다!
+
+  발견한 사실:
+
+  1. downloaded-splits 디렉토리: Merge 작업이 완료되면 즉시 삭제됩니다. ✅
+  2. merge_scratch_directory: IndexedSplit이 split_scratch_directory를 소유하고 있고, 이는 parent인 merge_scratch_directory에 대한 참조를 유지합니다. 따라서 IndexedSplit이 packager에서 처리되고 drop될 때까지 삭제되지 않습니다. ✅
+
+  프로덕션에서 디렉토리가 누적된다면:
+
+  실제로 디렉토리가 계속 증가한다면 다음 원인들을 확인해야 합니다:
+
+  1. Packager 파이프라인 문제: Packager가 split을 처리하지 못하고 멈춰있는지 확인
+  2. 에러 발생: Merge나 upload 과정에서 반복적인 실패 발생
+  3. 메모리 누수: IndexedSplit이 어딘가에서 계속 참조되어 drop되지 않음
+  4. 파일 시스템 문제: 열린 파일 핸들로 인해 디렉토리 삭제 실패
+
+  로그에서 "failed to merge splits" 에러나 packager 관련 에러를 확인해보세요.
+
+
+
+

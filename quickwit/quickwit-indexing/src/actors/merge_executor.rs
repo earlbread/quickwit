@@ -631,6 +631,15 @@ mod tests {
         let merge_scratch_directory = TempDirectory::for_test();
         let downloaded_splits_directory =
             merge_scratch_directory.named_temp_child("downloaded-splits-")?;
+
+        // Save paths before moving into MergeScratch to verify cleanup later
+        let merge_scratch_path = merge_scratch_directory.path().to_path_buf();
+        let downloaded_splits_path = downloaded_splits_directory.path().to_path_buf();
+
+        // Verify directories exist
+        assert!(merge_scratch_path.try_exists().unwrap());
+        assert!(downloaded_splits_path.try_exists().unwrap());
+
         let mut tantivy_dirs: Vec<Box<dyn Directory>> = Vec::new();
         for split_meta in &split_metas {
             let split_filename = split_file(split_meta.split_id());
@@ -669,6 +678,14 @@ mod tests {
             .spawn(merge_executor);
         merge_executor_mailbox.send_message(merge_scratch).await?;
         merge_executor_handle.process_pending_and_observe().await;
+
+        // Verify downloaded_splits_directory is cleaned up
+        assert!(
+            !downloaded_splits_path.try_exists().unwrap(),
+            "downloaded_splits_directory should be deleted after merge"
+        );
+
+        // Verify merge results
         let packager_msgs: Vec<IndexedSplitBatch> = merge_packager_inbox.drain_for_test_typed();
         assert_eq!(packager_msgs.len(), 1);
         let split_attrs_after_merge = &packager_msgs[0].splits[0].split_attrs;
@@ -682,6 +699,16 @@ mod tests {
             .try_into()?;
         let searcher = reader.searcher();
         assert_eq!(searcher.segment_readers().len(), 1);
+
+        // Drop packager_msgs to release IndexedSplit which holds a reference to
+        // merge_scratch_directory through split_scratch_directory
+        drop(packager_msgs);
+
+        // Now verify merge_scratch_directory is cleaned up after all references are dropped
+        assert!(
+            !merge_scratch_path.try_exists().unwrap(),
+            "merge_scratch_directory should be deleted after all splits are dropped"
+        );
         test_sandbox.assert_quit().await;
         Ok(())
     }
