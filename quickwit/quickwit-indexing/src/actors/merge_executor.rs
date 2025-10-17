@@ -713,6 +713,83 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_merge_executor_cleanup_on_failure() -> anyhow::Result<()> {
+        let doc_mapping_yaml = r#"
+            field_mappings:
+              - name: body
+                type: text
+        "#;
+        let test_sandbox =
+            TestSandbox::create("test-index", doc_mapping_yaml, "", &["body"]).await?;
+
+        let index_uid = test_sandbox.index_uid();
+        let merge_scratch_directory = TempDirectory::for_test();
+        let downloaded_splits_directory =
+            merge_scratch_directory.named_temp_child("downloaded-splits-")?;
+
+        // Save paths before moving into MergeScratch to verify cleanup later
+        let merge_scratch_path = merge_scratch_directory.path().to_path_buf();
+        let downloaded_splits_path = downloaded_splits_directory.path().to_path_buf();
+
+        // Verify directories exist
+        assert!(merge_scratch_path.try_exists().unwrap());
+        assert!(downloaded_splits_path.try_exists().unwrap());
+
+        // Create merge task with empty tantivy_dirs to trigger failure
+        let tantivy_dirs: Vec<Box<dyn Directory>> = Vec::new();
+        let merge_operation = MergeOperation::new_merge_operation(vec![]);
+        let merge_task = MergeTask::from_merge_operation_for_test(merge_operation);
+        let merge_scratch = MergeScratch {
+            merge_task,
+            tantivy_dirs,
+            merge_scratch_directory,
+            downloaded_splits_directory,
+        };
+
+        let pipeline_id = MergePipelineId {
+            node_id: test_sandbox.node_id(),
+            index_uid,
+            source_id: test_sandbox.source_id(),
+        };
+        let (merge_packager_mailbox, merge_packager_inbox) =
+            test_sandbox.universe().create_test_mailbox();
+        let merge_executor = MergeExecutor::new(
+            pipeline_id,
+            test_sandbox.metastore(),
+            test_sandbox.doc_mapper(),
+            IoControls::default(),
+            merge_packager_mailbox,
+        );
+        let (merge_executor_mailbox, merge_executor_handle) = test_sandbox
+            .universe()
+            .spawn_builder()
+            .spawn(merge_executor);
+        merge_executor_mailbox.send_message(merge_scratch).await?;
+        merge_executor_handle.process_pending_and_observe().await;
+
+        // Verify directories are cleaned up even on merge failure
+        assert!(
+            !downloaded_splits_path.try_exists().unwrap(),
+            "downloaded_splits_directory should be deleted even on merge failure"
+        );
+        assert!(
+            !merge_scratch_path.try_exists().unwrap(),
+            "merge_scratch_directory should be deleted even on merge failure"
+        );
+
+        // Verify no splits were sent to packager on failure
+        let packager_msgs: Vec<IndexedSplitBatch> = merge_packager_inbox.drain_for_test_typed();
+        assert_eq!(
+            packager_msgs.len(),
+            0,
+            "no splits should be sent to packager on merge failure"
+        );
+
+        test_sandbox.assert_quit().await;
+        Ok(())
+    }
+
     #[test]
     fn test_combine_partition_ids_singleton_unchanged() {
         assert_eq!(combine_partition_ids_aux([17]), 17);
